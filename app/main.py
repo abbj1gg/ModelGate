@@ -11,6 +11,10 @@ from app.providers.reliable import (
 )
 # ========= 新增导入 FallbackProvider =========
 from app.providers.fallback import FallbackProvider
+# ========= 新增导入 CircuitBreakerProvider =========
+from app.providers.circuit_breaker import (
+    CircuitBreakerProvider,
+)
 # ===========================================
 from app.services.chat_service import ChatService, UnsupportedModelError
 from app.core.rate_limit import enforce_rate_limit
@@ -155,44 +159,72 @@ settings = get_settings()
 providers = {
     "demo-chat": DemoProvider(),
 }
-# ========= 替换后的模型初始化代码 =========
+# ========= 替换后的模型初始化代码（增加CircuitBreakerProvider包装） =========
 if settings.litellm_api_key:
-    primary_provider = RetryingProvider(
-        provider=LiteLLMProvider(
-            provider_model=settings.litellm_model,
-            api_key=settings.litellm_api_key,
-            api_base=settings.litellm_api_base,
-            timeout=settings.litellm_timeout_seconds,
+    primary_provider = CircuitBreakerProvider(
+        provider=RetryingProvider(
+            provider=LiteLLMProvider(
+                provider_model=settings.litellm_model,
+                api_key=settings.litellm_api_key,
+                api_base=settings.litellm_api_base,
+                timeout=settings.litellm_timeout_seconds,
+            ),
+            policy=RetryPolicy(
+                max_attempts=3,
+                base_delay_seconds=0.25,
+            ),
         ),
-        policy=RetryPolicy(
-            max_attempts=3,
-            base_delay_seconds=0.25,
+        failure_threshold=(
+            settings.circuit_breaker_failure_threshold
+        ),
+        recovery_timeout_seconds=(
+            settings.circuit_breaker_recovery_timeout_seconds
         ),
     )
     if (
         settings.fallback_litellm_model
         and settings.fallback_litellm_api_key
     ):
-        fallback_provider = RetryingProvider(
-            provider=LiteLLMProvider(
-                provider_model=settings.fallback_litellm_model,
-                api_key=settings.fallback_litellm_api_key,
-                api_base=settings.fallback_litellm_api_base,
-                timeout=(
-                    settings.fallback_litellm_timeout_seconds
+        fallback_provider = CircuitBreakerProvider(
+            provider=RetryingProvider(
+                provider=LiteLLMProvider(
+                    provider_model=(
+                        settings.fallback_litellm_model
+                    ),
+                    api_key=(
+                        settings.fallback_litellm_api_key
+                    ),
+                    api_base=(
+                        settings.fallback_litellm_api_base
+                    ),
+                    timeout=(
+                        settings
+                        .fallback_litellm_timeout_seconds
+                    ),
+                ),
+                policy=RetryPolicy(
+                    max_attempts=2,
+                    base_delay_seconds=0.25,
                 ),
             ),
-            policy=RetryPolicy(
-                max_attempts=2,
-                base_delay_seconds=0.25,
+            failure_threshold=(
+                settings.circuit_breaker_failure_threshold
+            ),
+            recovery_timeout_seconds=(
+                settings
+                .circuit_breaker_recovery_timeout_seconds
             ),
         )
-        providers[settings.gateway_model_id] = FallbackProvider(
-            primary=primary_provider,
-            fallback=fallback_provider,
+        providers[settings.gateway_model_id] = (
+            FallbackProvider(
+                primary=primary_provider,
+                fallback=fallback_provider,
+            )
         )
     else:
-        providers[settings.gateway_model_id] = primary_provider
+        providers[settings.gateway_model_id] = (
+            primary_provider
+        )
 # ==========================================
 chat_service = ChatService(providers=providers)
 def require_bootstrap_admin(
