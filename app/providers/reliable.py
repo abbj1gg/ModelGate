@@ -2,7 +2,19 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import litellm
+
 from .base import ChatProvider
+
+
+RETRYABLE_EXCEPTIONS = (
+    TimeoutError,
+    ConnectionError,
+    litellm.Timeout,
+    litellm.APIConnectionError,
+    litellm.RateLimitError,
+    litellm.ServiceUnavailableError,
+)
 
 
 @dataclass(frozen=True)
@@ -46,14 +58,10 @@ class RetryingProvider(ChatProvider):
                     messages=messages,
                     temperature=temperature,
                 )
-            except (TimeoutError, ConnectionError) as exc:
+            except RETRYABLE_EXCEPTIONS as exc:
                 last_error = exc
 
-                is_last_attempt = (
-                    attempt == self.policy.max_attempts - 1
-                )
-
-                if is_last_attempt:
+                if attempt == self.policy.max_attempts - 1:
                     raise
 
                 delay = self.policy.base_delay_seconds * (
