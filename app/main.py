@@ -9,6 +9,9 @@ from app.providers.reliable import (
     RetryPolicy,
     RetryingProvider,
 )
+# ========= 新增导入 FallbackProvider =========
+from app.providers.fallback import FallbackProvider
+# ===========================================
 from app.services.chat_service import ChatService, UnsupportedModelError
 from app.core.rate_limit import enforce_rate_limit
 from time import monotonic
@@ -152,8 +155,9 @@ settings = get_settings()
 providers = {
     "demo-chat": DemoProvider(),
 }
+# ========= 替换后的模型初始化代码 =========
 if settings.litellm_api_key:
-    providers[settings.gateway_model_id] = RetryingProvider(
+    primary_provider = RetryingProvider(
         provider=LiteLLMProvider(
             provider_model=settings.litellm_model,
             api_key=settings.litellm_api_key,
@@ -165,6 +169,31 @@ if settings.litellm_api_key:
             base_delay_seconds=0.25,
         ),
     )
+    if (
+        settings.fallback_litellm_model
+        and settings.fallback_litellm_api_key
+    ):
+        fallback_provider = RetryingProvider(
+            provider=LiteLLMProvider(
+                provider_model=settings.fallback_litellm_model,
+                api_key=settings.fallback_litellm_api_key,
+                api_base=settings.fallback_litellm_api_base,
+                timeout=(
+                    settings.fallback_litellm_timeout_seconds
+                ),
+            ),
+            policy=RetryPolicy(
+                max_attempts=2,
+                base_delay_seconds=0.25,
+            ),
+        )
+        providers[settings.gateway_model_id] = FallbackProvider(
+            primary=primary_provider,
+            fallback=fallback_provider,
+        )
+    else:
+        providers[settings.gateway_model_id] = primary_provider
+# ==========================================
 chat_service = ChatService(providers=providers)
 def require_bootstrap_admin(
     principal: Principal = Depends(enforce_rate_limit),
