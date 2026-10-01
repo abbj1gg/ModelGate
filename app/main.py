@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 from app.core.config import get_settings
 from app.providers.demo import DemoProvider
 from app.providers.litellm_provider import LiteLLMProvider
+from app.providers.reliable import (
+    RetryPolicy,
+    RetryingProvider,
+)
 from app.services.chat_service import ChatService, UnsupportedModelError
 from app.core.rate_limit import enforce_rate_limit
 from time import monotonic
@@ -149,11 +153,17 @@ providers = {
     "demo-chat": DemoProvider(),
 }
 if settings.litellm_api_key:
-    providers[settings.gateway_model_id] = LiteLLMProvider(
-        provider_model=settings.litellm_model,
-        api_key=settings.litellm_api_key,
-        api_base=settings.litellm_api_base,
-        timeout=settings.litellm_timeout_seconds,
+    providers[settings.gateway_model_id] = RetryingProvider(
+        provider=LiteLLMProvider(
+            provider_model=settings.litellm_model,
+            api_key=settings.litellm_api_key,
+            api_base=settings.litellm_api_base,
+            timeout=settings.litellm_timeout_seconds,
+        ),
+        policy=RetryPolicy(
+            max_attempts=3,
+            base_delay_seconds=0.25,
+        ),
     )
 chat_service = ChatService(providers=providers)
 def require_bootstrap_admin(
