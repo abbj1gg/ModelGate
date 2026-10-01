@@ -1,10 +1,20 @@
 from datetime import datetime, timezone
 from typing import Literal
+import litellm
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from app.core.config import get_settings
 from app.providers.demo import DemoProvider
 from app.providers.litellm_provider import LiteLLMProvider
+from app.providers.reliable import (
+    RetryPolicy,
+    RetryingProvider,
+)
+from app.providers.fallback import FallbackProvider
+from app.providers.circuit_breaker import (
+    CircuitBreakerProvider,
+    CircuitOpenError,
+)
 from app.services.chat_service import ChatService, UnsupportedModelError
 from app.core.rate_limit import enforce_rate_limit
 from time import monotonic
@@ -20,11 +30,13 @@ from app.core.security import (
     get_identity_store,
     require_api_key,
 )
+
 app = FastAPI(
     title="ModelGate",
     description="A lightweight multi-tenant LLM API gateway.",
     version="0.1.0",
 )
+
 # ====================== 审计中间件开始 ======================
 def _audit_error_detail(status_code: int) -> str | None:
     if status_code < 400:
@@ -39,6 +51,8 @@ def _audit_error_detail(status_code: int) -> str | None:
     if status_code >= 500:
         return "Internal server error"
     return descriptions.get(status_code, "Request failed")
+
+
 def _record_audit(
     *,
     request: Request,
@@ -61,6 +75,8 @@ def _record_audit(
         ),
         latency_ms=latency_ms,
     )
+
+
 @app.middleware("http")
 async def audit_requests(request: Request, call_next):
     should_audit = request.url.path.startswith(
@@ -112,6 +128,8 @@ async def audit_requests(request: Request, call_next):
             )
     return response
 # ====================== 审计中间件结束 ======================
+
+
 # ========== 新增：_usage_value 工具函数（路由定义之前） ==========
 def _usage_value(usage: object, field: str) -> int:
     if usage is None:
@@ -122,40 +140,117 @@ def _usage_value(usage: object, field: str) -> int:
         value = getattr(usage, field, 0)
     return int(value or 0)
 # ==============================================================
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str = Field(min_length=1)
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     stream: bool = False
+
+
 # ========== 【新增：3个Admin请求Model，放在ChatCompletionRequest后面】 ==========
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
+
+
 class CreateApplicationRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
     user_id: str
+
+
 class CreateApiKeyRequest(BaseModel):
     user_id: str
     application_id: str
     allowed_models: list[str] = Field(min_length=1)
+
+
 # ========== 新增配额更新请求模型 ==========
 class QuotaUpdateRequest(BaseModel):
     monthly_token_limit: int = Field(gt=0)
 # ============================================================================
+
+
 settings = get_settings()
 providers = {
     "demo-chat": DemoProvider(),
 }
+
+# ========= 替换后的模型初始化代码（增加CircuitBreakerProvider包装） =========
 if settings.litellm_api_key:
-    providers[settings.gateway_model_id] = LiteLLMProvider(
-        provider_model=settings.litellm_model,
-        api_key=settings.litellm_api_key,
-        api_base=settings.litellm_api_base,
-        timeout=settings.litellm_timeout_seconds,
+    primary_provider = CircuitBreakerProvider(
+        provider=RetryingProvider(
+            provider=LiteLLMProvider(
+                provider_model=settings.litellm_model,
+                api_key=settings.litellm_api_key,
+                api_base=settings.litellm_api_base,
+                timeout=settings.litellm_timeout_seconds,
+            ),
+            policy=RetryPolicy(
+                max_attempts=3,
+                base_delay_seconds=0.25,
+            ),
+        ),
+        failure_threshold=(
+            settings.circuit_breaker_failure_threshold
+        ),
+        recovery_timeout_seconds=(
+            settings.circuit_breaker_recovery_timeout_seconds
+        ),
     )
+    if (
+        settings.fallback_litellm_model
+        and settings.fallback_litellm_api_key
+    ):
+        fallback_provider = CircuitBreakerProvider(
+            provider=RetryingProvider(
+                provider=LiteLLMProvider(
+                    provider_model=(
+                        settings.fallback_litellm_model
+                    ),
+                    api_key=(
+                        settings.fallback_litellm_api_key
+                    ),
+                    api_base=(
+                        settings.fallback_litellm_api_base
+                    ),
+                    timeout=(
+                        settings
+                        .fallback_litellm_timeout_seconds
+                    ),
+                ),
+                policy=RetryPolicy(
+                    max_attempts=2,
+                    base_delay_seconds=0.25,
+                ),
+            ),
+            failure_threshold=(
+                settings.circuit_breaker_failure_threshold
+            ),
+            recovery_timeout_seconds=(
+                settings
+                .circuit_breaker_recovery_timeout_seconds
+            ),
+        )
+        providers[settings.gateway_model_id] = (
+            FallbackProvider(
+                primary=primary_provider,
+                fallback=fallback_provider,
+            )
+        )
+    else:
+        providers[settings.gateway_model_id] = (
+            primary_provider
+        )
+# ==========================================
 chat_service = ChatService(providers=providers)
+
+
 def require_bootstrap_admin(
     principal: Principal = Depends(enforce_rate_limit),
 ) -> Principal:
@@ -169,6 +264,8 @@ def require_bootstrap_admin(
             detail="Administrator permission required",
         )
     return principal
+
+
 # 别名，满足 Depends(require_admin) 的写法
 require_admin = require_bootstrap_admin
 # ============================================================================
@@ -180,6 +277,8 @@ available_models = [
     }
     for model_id in providers
 ]
+
+
 @app.get("/health", tags=["system"])
 async def health_check() -> dict[str, str]:
     return {
@@ -188,6 +287,8 @@ async def health_check() -> dict[str, str]:
         "version": app.version,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
 @app.get("/v1/models", tags=["models"])
 async def list_models(
     principal: Principal = Depends(require_api_key),
@@ -201,6 +302,8 @@ async def list_models(
         "object": "list",
         "data": visible_models,
     }
+
+
 @app.get("/v1/whoami", tags=["identity"])
 async def who_am_i(
     principal: Principal = Depends(require_api_key),
@@ -212,6 +315,8 @@ async def who_am_i(
         "application_id": principal.application_id,
         "allowed_models": sorted(principal.allowed_models),
     }
+
+
 # ========== 【新增：3个admin接口，放在whoami后面】 ==========
 @app.post("/admin/users", status_code=201, tags=["admin"])
 async def create_user(
@@ -225,6 +330,8 @@ async def create_user(
             status_code=409,
             detail=str(exc),
         ) from exc
+
+
 @app.post(
     "/admin/applications",
     status_code=201,
@@ -244,12 +351,16 @@ async def create_application(
             status_code=400,
             detail=str(exc),
         ) from exc
+
+
 # ========= 新增 /admin/usage 用量汇总接口（管理员专用）=========
 @app.get("/admin/usage", tags=["admin"])
 def get_usage_summary(
     _admin: Principal = Depends(require_admin),
 ) -> list[dict[str, object]]:
     return get_usage_store().summarize()
+
+
 @app.get("/admin/audit-logs", tags=["admin"])
 def list_audit_logs(
     limit: int = Query(default=100, ge=1, le=500),
@@ -261,6 +372,8 @@ def list_audit_logs(
         failures_only=failures_only,
     )
 # ============================================================
+
+
 # ========== 新增配额管理接口 ==========
 @app.post(
     "/admin/api-keys/{key_id}/quota",
@@ -276,6 +389,8 @@ def set_api_key_quota(
         monthly_token_limit=request.monthly_token_limit,
     )
     return get_quota_store().get_snapshot(key_id)
+
+
 @app.get(
     "/admin/api-keys/{key_id}/quota",
     tags=["admin"],
@@ -285,6 +400,8 @@ def get_api_key_quota(
     _admin: Principal = Depends(require_admin),
 ) -> dict[str, object]:
     return get_quota_store().get_snapshot(key_id)
+
+
 # ========= 新增：禁用、轮转密钥接口 =========
 @app.post(
     "/admin/api-keys/{key_id}/disable",
@@ -301,6 +418,8 @@ def disable_api_key(
             status_code=404,
             detail=str(exc),
         ) from exc
+
+
 @app.post(
     "/admin/api-keys/{key_id}/rotate",
     tags=["admin"],
@@ -317,6 +436,8 @@ def rotate_api_key(
             detail=str(exc),
         ) from exc
 # =====================================
+
+
 @app.post(
     "/admin/api-keys",
     status_code=201,
@@ -350,6 +471,8 @@ async def create_api_key(
             detail=str(exc),
         ) from exc
 # ======================================================
+
+
 @app.post("/v1/chat/completions", tags=["chat"])
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -396,4 +519,48 @@ async def chat_completions(
         raise HTTPException(
             status_code=400,
             detail=str(exc),
+        ) from exc
+    except CircuitOpenError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Upstream model temporarily unavailable",
+            headers={
+                "Retry-After": str(
+                    int(
+                        settings
+                        .circuit_breaker_recovery_timeout_seconds
+                    )
+                )
+            },
+        ) from exc
+    except (
+        litellm.Timeout,
+        TimeoutError,
+    ) as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Upstream model request timed out",
+        ) from exc
+    except litellm.RateLimitError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Upstream model rate limit exceeded",
+        ) from exc
+    except litellm.ServiceUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Upstream model service unavailable",
+        ) from exc
+    except (
+        litellm.APIConnectionError,
+        ConnectionError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to connect to upstream model",
+        ) from exc
+    except litellm.AuthenticationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream model authentication failed",
         ) from exc
