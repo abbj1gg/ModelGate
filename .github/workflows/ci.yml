@@ -13,6 +13,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      AUTH_ENABLED: "true"
+      DEV_API_KEY: "mg_dev_123456_change_me"
+      DEMO_MODE: "true"
+      LITELLM_API_KEY: "ci-placeholder"
+      LITELLM_MODEL: "deepseek/deepseek-chat"
+      DATABASE_PATH: "data/modelgate-ci.db"
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
